@@ -7,16 +7,17 @@
 //   - the model list is not fixed and not documented; it is read live from
 //     `GET /v1/models` for the signed-in account, so a model added upstream
 //     works without a new release of this plugin;
-//   - the allowance, when the relay reports one, is only ever in `x-quota-*`
-//     response headers, so `usage` has to read a response to know it — and must
-//     show "unknown" rather than a made-up 0% when the headers are absent.
+//   - the allowance is a dollar balance, told only by the relay's OpenAI-style
+//     billing routes (`/v1/dashboard/billing/subscription` and `/usage`), so
+//     `usage` has to call them — and must show "unknown" rather than a made-up
+//     0% when they cannot be read.
 //
 // Everything else — base URL, key, request forwarding — is a normal API key
 // provider. The relay has four advertised lines (主站 / 备用 zzz / 备用 cn /
 // upload); the plugin uses the main line by default, and any of them can be
 // selected with the `baseURL` option (or a providers.json override).
 
-import { quotaWindow, planOf, nextUtcMidnight } from "./quota.mjs";
+import { balanceWindow, planOf } from "./quota.mjs";
 import { CHAT_SDK, DEFAULT_MODEL, configModels, accountModels, modelIDs } from "./models.mjs";
 
 export const PROVIDER = "eazydata";
@@ -54,52 +55,59 @@ export async function EazyDataPlugin(input, options = {}) {
   // models hook starts from it.
   const template = configModels({ reasoning });
 
-  // The newest allowance any response reported, per account key. Only a
-  // fallback for `usage` when its own read fails: keeping it under the key
-  // keeps two signed-in keys from showing each other's spend.
+  // The newest balance any read reported, per account key. A fallback for
+  // `usage` when its own read fails: keeping it under the key keeps two
+  // signed-in keys from showing each other's spend.
   const seen = new Map();
-  const remember = (key, headers, now) => {
-    if (!key) return;
-    const window = quotaWindow(headers, now);
-    if (window) seen.set(key, { window, at: now });
-  };
 
-  // One account's worth of headers, from a GET the caller is making anyway.
-  async function readAllowance(apiKey) {
-    const res = await fetchImpl(`${baseURL}/models`, {
+  // One GET, parsed as JSON, with the account's key. Throws on a network or
+  // HTTP failure so the caller can fall back rather than read garbage.
+  async function getJSON(pathname, apiKey) {
+    const res = await fetchImpl(`${baseURL}${pathname}`, {
       headers: { authorization: `Bearer ${apiKey}`, accept: "application/json" },
       redirect: "error",
       signal: AbortSignal.timeout(timeout),
     });
-    const window = quotaWindow(res.headers);
-    if (window) seen.set(apiKey, { window, at: Date.now() });
-    // Nothing reads this body; drop it rather than hold the connection open.
-    try {
-      await res.body?.cancel?.();
-    } catch {
-      /* already gone */
-    }
-    return { res, window };
+    if (!res.ok) throw new Error(`billing read returned HTTP ${res.status}`);
+    return res.json();
   }
 
-  // The allowance, when it looks like a hard stop, is a rest until its reset.
-  // The relay may or may not send Retry-After; when it doesn't, the reset
-  // instant (header, or the body's own words) does.
-  async function spentAllowance(res) {
-    const text = await res.text().catch(() => "");
-    let body = null;
+  // The account's dollar balance, from the two billing routes eazydata
+  // (one-api / new-api style) exposes to the signed-in key. `undefined` when
+  // neither route said anything usable.
+  async function readBalance(apiKey) {
+    const [subscription, usage] = await Promise.all([
+      getJSON("/dashboard/billing/subscription", apiKey).catch(() => null),
+      getJSON("/dashboard/billing/usage", apiKey).catch(() => null),
+    ]);
+    const window = balanceWindow(subscription, usage);
+    if (window) seen.set(apiKey, { window, at: Date.now() });
+    return { window, subscription, usage };
+  }
+
+  // Whether the key itself is dead, from a billing read that failed. A 401/403
+  // is about the key, so the account is the one to fix.
+  async function keyRejected(apiKey) {
     try {
-      body = JSON.parse(text);
+      const res = await fetchImpl(`${baseURL}/dashboard/billing/subscription`, {
+        headers: { authorization: `Bearer ${apiKey}`, accept: "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(timeout),
+      });
+      return res.status === 401 || res.status === 403;
     } catch {
-      /* non-JSON body: pass its own words through */
+      return false;
     }
+  }
+
+  // A 429 that is the balance running out has no reset instant to wait for —
+  // the balance is cumulative, not a daily bucket — so when the relay sends no
+  // Retry-After, ask for a moderate rest rather than hammering a dead balance.
+  // A user has to top up, which happens outside any window this plugin sees.
+  async function spentBalance(res) {
+    const text = await res.text().catch(() => "");
     const headers = new Headers(res.headers);
-    if (!headers.get("retry-after")) {
-      const reset = body?.error?.reset_at ?? headers.get("x-quota-reset");
-      const at = typeof reset === "string" ? Date.parse(reset) : NaN;
-      const until = Number.isFinite(at) ? at : nextUtcMidnight().getTime();
-      headers.set("retry-after", String(Math.max(1, Math.ceil((until - Date.now()) / 1000))));
-    }
+    if (!headers.get("retry-after")) headers.set("retry-after", String(3600));
     return new Response(text, { status: res.status, statusText: res.statusText, headers });
   }
 
@@ -186,13 +194,6 @@ export async function EazyDataPlugin(input, options = {}) {
                   error: message || `The key was refused (HTTP ${res.status}). Check it on eazydata.org.`,
                 };
               }
-              const window = quotaWindow(res.headers);
-              if (window) seen.set(key, { window, at: Date.now() });
-              try {
-                await res.body?.cancel?.();
-              } catch {
-                /* already gone */
-              }
             } catch {
               // Unreachable right now: keep the key, let requests say so.
             }
@@ -239,12 +240,11 @@ export async function EazyDataPlugin(input, options = {}) {
               signal: init?.signal ?? request.signal,
               redirect: "error",
             });
-            remember(apiKey, res.headers, Date.now());
 
-            // A 429 that is the allowance running out gets a working
+            // A 429 that is the balance running out gets a working
             // Retry-After; a concurrency 429 keeps the relay's own short one.
             if (res.status === 429 && (await isSpent(res))) {
-              return spentAllowance(res);
+              return spentBalance(res);
             }
 
             return res;
@@ -261,17 +261,19 @@ export async function EazyDataPlugin(input, options = {}) {
         let error = "";
         let signIn;
         try {
-          const read = await readAllowance(apiKey);
+          const read = await readBalance(apiKey);
           window = read.window;
-          if (read.res.status === 401) {
-            // 401 is about the key itself, so the account is the one to fix.
+          if (!window && (await keyRejected(apiKey))) {
+            // A 401/403 is about the key itself, so the account is to fix.
             signIn = "expired";
             error = "The API key is no longer accepted. Sign in again.";
+          } else if (!window) {
+            error = "The relay reported no balance.";
           }
         } catch (e) {
-          error = `Could not read the allowance: ${e?.message ?? e}`;
+          error = `Could not read the balance: ${e?.message ?? e}`;
         }
-        // A read that failed falls back to what a request already reported,
+        // A read that failed falls back to what an earlier read already saw,
         // still under this account's own key.
         window ??= seen.get(apiKey)?.window ?? null;
 
@@ -281,11 +283,10 @@ export async function EazyDataPlugin(input, options = {}) {
         } else {
           // No figures at all: shown, never routed on (no `used`, no counts).
           windows.push({
-            name: "Plan allowance",
-            span: 86400,
-            resetsAt: nextUtcMidnight().toISOString(),
-            unit: "tokens",
-            display: "The allowance is reported in response headers; it appears after this account's first request.",
+            name: "Balance",
+            span: 10 * 365 * 86400,
+            unit: "usd",
+            display: "The balance is read from the relay's billing routes; it appears once the account can be read.",
           });
         }
         return {
@@ -309,7 +310,6 @@ export async function EazyDataPlugin(input, options = {}) {
             redirect: "error",
             signal: AbortSignal.timeout(timeout),
           });
-          remember(apiKey, res.headers, Date.now());
           // The list is only usable when the account could read it.
           if (!res.ok) return provider.models;
           const ids = modelIDs(await res.json());
@@ -338,7 +338,6 @@ export const _internal = {
   LINES,
   DEFAULT_MODEL,
   keyOf,
-  quotaWindow,
   planOf,
   configModels,
   accountModels,

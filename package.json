@@ -1,6 +1,6 @@
 {
   "name": "eazydata",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
   "type": "module",
   "main": "./opencode.mjs",
@@ -47,8 +47,8 @@
   "magpie": {
     "name": "eazydata",
     "summary": {
-      "en": "OpenAI-compatible relay on eazydata.org, with its model list read live from /v1/models and the daily allowance read from the API's own quota headers",
-      "zh": "eazydata.org 上的 OpenAI 兼容中转，模型列表实时读取 /v1/models，每日额度直接读 API 的配额响应头"
+      "en": "OpenAI-compatible relay on eazydata.org, with its model list read live from /v1/models and the account's dollar balance read from the relay's billing routes",
+      "zh": "eazydata.org 上的 OpenAI 兼容中转，模型列表实时读取 /v1/models，账户余额读取中转站的 billing 接口"
     },
     "maxConcurrency": 8,
     "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iOCIgZmlsbD0iIzBkMTYyNCIvPjxwYXRoIGQ9Ik0xMCAyMmwxMi04LTEyLTh6IiBmaWxsPSIjNGRjOWZmIi8+PGNpcmNsZSBjeD0iMjMiIGN5PSIyMiIgcj0iMyIgZmlsbD0iIzM0ZDg5OSIvPjwvc3ZnPg=="

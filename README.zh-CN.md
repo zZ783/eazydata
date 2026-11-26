@@ -10,12 +10,15 @@ base URL、一个 API Key，把许多模型家族聚在身后。
   的账号实时读取 `GET /v1/models`，只提供这把 Key 真正能调用的模型。上游新加的
   模型无需新版插件即可使用；插件不认识的模型会得到一份宽松的通用描述（文/图输入、
   支持工具调用、128K 上下文），而不是被丢弃。
-- **能读到就用上的额度。** 中转站用 `x-quota-*` 响应头报告用量。`usage` 读取一次
-  响应，把它变成 magpie 展示与路由用的窗口。绝不编造数字：没有这些响应头时，窗口
-  只给一行说明、不给百分比，而不是写成 0%。
-- **可用的重置时间。** 当额度用完、中转站返回 429 却没带 `Retry-After` 时，插件会
-  依据重置时刻补一个，让这把 Key 休息到额度恢复；而普通的并发 429 仍保留中转站自己
-  的短 `Retry-After`。
+- **真实读取美元余额。** 中转站不返回任何用量响应头；它向 Key 暴露的是 OpenAI 风格的
+  计费接口：`GET /v1/dashboard/billing/subscription`（`hard_limit_usd`）和
+  `GET /v1/dashboard/billing/usage`（`total_usage`，单位是分），所以 `usage`
+  会调用它们并显示一个 **美元余额** 窗口（如「$99.96 left of $100」）。这是累计余额、
+  不是每日 token 桶，因此没有重置时间。绝不编造数字：接口读不到时，窗口只给一行说明、
+  不给百分比，而不是写成 0%。
+- **余额用完时合理休息。** 余额耗尽、中转站返回 429 却没带 `Retry-After` 时，插件
+  补一个适中的 `Retry-After`，避免死磕；普通并发 429 仍保留中转站自己的短
+  `Retry-After`。
 
 ## 安装
 
@@ -78,7 +81,7 @@ opencode.mjs       OpenCode 1.x 门面
 opencode2.mjs      OpenCode 2.x 门面（与社区副本逐字节一致）
 src/index.mjs      插件本体：config、auth、provider.models
 src/models.mjs     通用模型形态 + 账号实时模型列表
-src/quota.mjs      x-quota-* 响应头 → 用量窗口
+src/quota.mjs      billing 接口 → 美元余额窗口
 test/              测试，`npm test` 运行
 ```
 

@@ -1,76 +1,96 @@
-// The plan allowance, read from the quota headers.
+// The account's allowance, read from the relay's OpenAI-style billing routes.
 //
-// eazydata documents no JSON route that reports an account's usage; the relay
-// follows the common OpenAI-compatible convention of describing it in
-// `x-quota-*` response headers (limit / used / remaining / reset). When those
-// headers are present they are the source of truth; when they are absent — an
-// upstream that sends none — nothing here invents a number, and the window is
-// left without a percentage so magpie shows "unknown" rather than 0%.
+// eazydata is an one-api / new-api style relay. It sends no `x-quota-*` headers
+// (not on /v1/models, not on /v1/chat/completions), so nothing about the
+// allowance can be read from a normal response. What it does expose, to the
+// signed-in key, is the OpenAI billing pair:
 //
-// The allowance is not assumed to be a daily token bucket either: the reset
-// instant carried in `x-quota-reset` decides the period, and the unit follows
-// what the headers report. When nothing is said, it is a per-day token window
-// that resets at the next 00:00 UTC, which is the convention this relay family
-// uses.
+//   GET /v1/dashboard/billing/subscription
+//     { object:"billing_subscription", hard_limit_usd: 100.003142,
+//       soft_limit_usd: 100.003142, has_payment_method: true, access_until: 0 }
+//
+//   GET /v1/dashboard/billing/usage            (date params are ignored — the
+//     { object:"list", total_usage: 4.4232 }   figure is cumulative)
+//
+// The allowance is a **dollar balance**, not a token bucket: `hard_limit_usd`
+// is the ceiling in dollars, and `total_usage` is the spend so far **in cents**
+// (4.4232 → $0.044232). There is no daily reset — `access_until: 0` means no
+// expiry — so the window is an all-time balance and `resetsAt` is left out.
+//
+// Nothing here is invented: missing or unreadable figures leave the window
+// without a percentage (magpie shows "unknown"), never a made-up 0%.
 
-export const DAY_S = 86400; // magpie's UsageWindow.span unit is seconds, not ms
-export const DAY_MS = 86_400_000;
+export const DAY_S = 86400;
 
-// A header value as a whole count, or null when the API did not send one.
-function count(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const n = Number(value);
-  return Number.isFinite(n) && n >= 0 ? Math.trunc(n) : null;
+// The balance is cumulative, so its span is large; magpie uses `span` only to
+// describe how far the window looks back. Ten years reads as "all time".
+export const BALANCE_SPAN_S = 10 * 365 * DAY_S;
+
+const round2 = (n) => Math.round(n * 100) / 100;
+
+// A finite non-negative number from a JSON value, or null.
+function num(value) {
+  const n = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-export function nextUtcMidnight(now = Date.now()) {
-  return new Date((Math.floor(now / DAY_MS) + 1) * DAY_MS);
+// A billing subscription's dollar limit, from either the top level or a
+// wrapped `data` object. `hard_limit_usd` is the ceiling; `soft_limit_usd`
+// falls back when the hard one is missing or zero (some relays send -1/0 for
+// "unlimited", which is not a usable ceiling and is treated as unknown).
+export function limitOf(subscription) {
+  const body = subscription?.data ?? subscription;
+  if (!body || typeof body !== "object") return null;
+  for (const key of ["hard_limit_usd", "system_hard_limit_usd", "soft_limit_usd"]) {
+    const n = num(body[key]);
+    if (n !== null && n > 0) return n;
+  }
+  return null;
 }
 
-// An ISO instant from x-quota-reset, or the next 00:00 UTC when it is absent
-// or unreadable.
-export function resetInstant(value, now = Date.now()) {
-  const at = typeof value === "string" ? Date.parse(value) : NaN;
-  return Number.isFinite(at) ? new Date(at) : nextUtcMidnight(now);
+// The cumulative spend, converted from one-api's cents into dollars. A body
+// that already looks like dollars (a value under a dollar-scale limit supplied
+// alongside) is not re-divided: the conversion only leans on the documented
+// "cents" convention and is applied once.
+export function spentOf(usage) {
+  const body = usage?.data ?? usage;
+  if (!body || typeof body !== "object") return null;
+  const cents = num(body.total_usage);
+  if (cents === null) return null;
+  // Dollars, kept to sub-cent precision: the relay reports cents (4.4232 →
+  // $0.044232), and rounding the dollar result to 6 places drops binary noise.
+  return Math.round(cents * 10000) / 1_000_000;
 }
 
-// One window for the allowance period, or undefined when the response said
-// nothing about the allowance. `used` is left out — never written as 0 — when
-// the spend is unknown, because magpie reads a missing percentage as "unknown"
-// and a 0 as "nothing used".
-export function quotaWindow(headers, now = Date.now()) {
-  const limit = count(headers.get("x-quota-limit"));
-  const used = count(headers.get("x-quota-used"));
-  const remaining = count(headers.get("x-quota-remaining"));
-  if (limit === null && used === null && remaining === null) return undefined;
-
-  const total = limit ?? (used !== null && remaining !== null ? used + remaining : null);
-  const spent =
-    used !== null ? used : total !== null && remaining !== null ? Math.max(0, total - remaining) : null;
+// One window for the dollar balance, or undefined when the relay reported
+// nothing usable. `used` is a percentage; it is left out — never written as 0 —
+// when either the limit or the spend is unknown.
+export function balanceWindow(subscription, usage) {
+  const limit = limitOf(subscription);
+  const spent = spentOf(usage);
+  if (limit === null && spent === null) return undefined;
 
   const window = {
-    name: "Plan allowance",
-    span: DAY_S,
-    unit: "tokens",
-    resetsAt: resetInstant(headers.get("x-quota-reset"), now).toISOString(),
+    name: "Balance",
+    span: BALANCE_SPAN_S,
+    unit: "usd",
   };
-  if (total !== null) window.limit = total;
-  if (spent !== null) window.amount = spent;
-  if (total !== null && spent !== null) {
-    if (total > 0) window.used = (100 * spent) / total; // over 100 when the allowance is spent
-    // amount / limit / unit is what magpie renders; no display line needed.
+  if (limit !== null) window.limit = round2(limit);
+  if (spent !== null) window.amount = round2(spent);
+  if (limit !== null && spent !== null) {
+    if (limit > 0) {
+      window.used = (100 * spent) / limit; // over 100 if a balance went negative
+      window.display = `$${round2(Math.max(0, limit - spent))} left of $${round2(limit)}`;
+    }
   } else if (spent !== null) {
-    window.display = `${spent.toLocaleString("en-US")} tokens used; the limit was not reported`;
-  } else if (total !== null) {
-    window.display = `${total.toLocaleString("en-US")} tokens; the spend was not reported`;
+    window.display = `$${round2(spent)} spent; the limit was not reported`;
   } else {
-    window.display = `${remaining.toLocaleString("en-US")} tokens left`;
+    window.display = `$${round2(limit)} limit; the spend was not reported`;
   }
   return window;
 }
 
-// The plan name magpie shows on the account. The relay reports no tier name, so
-// say what it is rather than guess a subscription.
+// The plan name magpie shows. The relay reports no tier name, only a balance.
 export function planOf(window) {
   return window ? "eazydata" : "eazydata";
 }

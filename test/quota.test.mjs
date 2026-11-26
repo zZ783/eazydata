@@ -1,81 +1,80 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { quotaWindow, planOf, resetInstant, nextUtcMidnight } from "../src/quota.mjs";
+import { limitOf, spentOf, balanceWindow, planOf, BALANCE_SPAN_S } from "../src/quota.mjs";
 
-const headers = (pairs) => new Headers(pairs);
-
-test("quotaWindow reads the quota headers into one window", () => {
-  const now = Date.parse("2026-11-25T10:00:00Z");
-  const w = quotaWindow(
-    headers({
-      "x-quota-limit": "100000000",
-      "x-quota-used": "25000000",
-      "x-quota-remaining": "75000000",
-      "x-quota-reset": "2026-11-26T00:00:00Z",
-    }),
-    now,
-  );
-  assert.equal(w.name, "Plan allowance");
-  assert.equal(w.span, 86400);
-  assert.equal(w.unit, "tokens");
-  assert.equal(w.limit, 100_000_000);
-  assert.equal(w.amount, 25_000_000);
-  assert.equal(w.used, 25);
-  assert.equal(w.resetsAt, "2026-11-26T00:00:00.000Z");
+test("limitOf reads the dollar ceiling from a subscription", () => {
+  assert.equal(limitOf({ hard_limit_usd: 100.003142, soft_limit_usd: 100.003142 }), 100.003142);
 });
 
-test("quotaWindow derives the spend from limit and remaining", () => {
-  const w = quotaWindow(
-    headers({ "x-quota-limit": "2000000", "x-quota-remaining": "500000" }),
-    Date.parse("2026-11-25T10:00:00Z"),
-  );
-  assert.equal(w.limit, 2_000_000);
-  assert.equal(w.amount, 1_500_000);
-  assert.equal(w.used, 75);
+test("limitOf ignores a zero or negative hard limit and falls back", () => {
+  assert.equal(limitOf({ hard_limit_usd: 0, soft_limit_usd: 50 }), 50);
+  assert.equal(limitOf({ hard_limit_usd: -1 }), null);
+  assert.equal(limitOf({}), null);
+  assert.equal(limitOf(null), null);
 });
 
-test("quotaWindow leaves used out rather than reporting zero when the spend is unknown", () => {
-  const w = quotaWindow(headers({ "x-quota-limit": "100000000" }));
-  assert.equal(w.limit, 100_000_000);
+test("limitOf unwraps a data wrapper", () => {
+  assert.equal(limitOf({ data: { hard_limit_usd: 20 } }), 20);
+});
+
+test("spentOf converts one-api cents into dollars", () => {
+  assert.equal(spentOf({ total_usage: 4.4232 }), 0.044232);
+  assert.equal(spentOf({ total_usage: 0 }), 0);
+  assert.equal(spentOf({}), null);
+  assert.equal(spentOf(null), null);
+});
+
+test("spentOf unwraps a data wrapper", () => {
+  assert.equal(spentOf({ data: { total_usage: 100 } }), 1);
+});
+
+test("balanceWindow turns the two routes into a dollar window with a percentage", () => {
+  const w = balanceWindow({ hard_limit_usd: 100 }, { total_usage: 442.32 }); // 442.32c = $4.4232
+  assert.equal(w.name, "Balance");
+  assert.equal(w.unit, "usd");
+  assert.equal(w.span, BALANCE_SPAN_S);
+  assert.equal(w.limit, 100);
+  assert.equal(w.amount, 4.42);
+  assert.equal(Math.round(w.used * 1000) / 1000, 4.423);
+  assert.match(w.display, /\$95\.58 left of \$100/);
+  // A cumulative balance has no reset instant.
+  assert.equal("resetsAt" in w, false);
+});
+
+test("balanceWindow derives the spend from a real account shape", () => {
+  const w = balanceWindow(
+    { hard_limit_usd: 100.003142, soft_limit_usd: 100.003142 },
+    { total_usage: 4.4232 },
+  );
+  assert.equal(w.limit, 100);
+  assert.equal(w.amount, 0.04);
+  assert.ok(w.used > 0 && w.used < 0.1);
+});
+
+test("balanceWindow leaves used out when the spend is unknown", () => {
+  const w = balanceWindow({ hard_limit_usd: 100 }, null);
+  assert.equal(w.limit, 100);
   assert.equal("used" in w, false);
   assert.equal(w.amount, undefined);
-  assert.match(w.display, /100,000,000 tokens/);
+  assert.match(w.display, /\$100 limit/);
 });
 
-test("quotaWindow reports a spend without a limit as a display line, not a percentage", () => {
-  const w = quotaWindow(headers({ "x-quota-used": "1234" }));
+test("balanceWindow leaves used out when the limit is unknown", () => {
+  const w = balanceWindow(null, { total_usage: 500 });
   assert.equal("used" in w, false);
-  assert.equal(w.amount, 1234);
-  assert.match(w.display, /1,234 tokens used/);
+  assert.equal(w.amount, 5);
+  assert.match(w.display, /\$5 spent/);
 });
 
-test("quotaWindow says nothing when the response said nothing", () => {
-  assert.equal(quotaWindow(headers({ "x-qos": "full" })), undefined);
+test("balanceWindow says nothing when both routes said nothing", () => {
+  assert.equal(balanceWindow(null, null), undefined);
 });
 
-test("quotaWindow allows the percentage to pass 100 once the allowance is spent", () => {
-  const w = quotaWindow(headers({ "x-quota-limit": "1000", "x-quota-used": "1500" }));
+test("balanceWindow allows the percentage to pass 100 on a negative balance", () => {
+  const w = balanceWindow({ hard_limit_usd: 10 }, { total_usage: 1500 }); // $15 spent of $10
   assert.equal(w.used, 150);
-});
-
-test("quotaWindow ignores unreadable counts instead of turning them into zero", () => {
-  const w = quotaWindow(headers({ "x-quota-limit": "lots", "x-quota-used": "10" }));
-  assert.equal(w.limit, undefined);
-  assert.equal(w.amount, 10);
-  assert.equal("used" in w, false);
-});
-
-test("resetInstant falls back to the next 00:00 UTC", () => {
-  const now = Date.parse("2026-11-25T23:59:59Z");
-  assert.equal(resetInstant(undefined, now).toISOString(), "2026-11-26T00:00:00.000Z");
-  assert.equal(resetInstant("not a date", now).toISOString(), "2026-11-26T00:00:00.000Z");
-  assert.equal(resetInstant("2026-11-27T00:00:00Z", now).toISOString(), "2026-11-27T00:00:00.000Z");
-});
-
-test("nextUtcMidnight always moves forward", () => {
-  assert.equal(nextUtcMidnight(Date.parse("2026-11-25T00:00:00Z")).toISOString(), "2026-11-26T00:00:00.000Z");
-  assert.equal(nextUtcMidnight(Date.parse("2026-11-25T00:00:01Z")).toISOString(), "2026-11-26T00:00:00.000Z");
+  assert.match(w.display, /\$0 left of \$10/);
 });
 
 test("planOf names the relay", () => {

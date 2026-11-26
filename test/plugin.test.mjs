@@ -4,12 +4,8 @@ import assert from "node:assert/strict";
 import { EazyDataPlugin, PROVIDER, BASE, ORIGIN, LINES, keyOf } from "../src/index.mjs";
 import { DEFAULT_MODEL } from "../src/models.mjs";
 
-const QUOTA = {
-  "x-quota-limit": "100000000",
-  "x-quota-used": "2500000",
-  "x-quota-remaining": "97500000",
-  "x-quota-reset": "2026-11-26T00:00:00Z",
-};
+const SUBSCRIPTION = { object: "billing_subscription", hard_limit_usd: 100.003142, soft_limit_usd: 100.003142, access_until: 0 };
+const USAGE = { object: "list", total_usage: 4.4232 };
 
 // A fetch double that records what was sent and answers with a scripted reply.
 function recorder(reply) {
@@ -93,7 +89,7 @@ test("the key is asked for through a prompt, so magpie hands it to authorize", a
 });
 
 test("the sign-in check accepts a working key and remembers the allowance it saw", async () => {
-  const { calls, fetchImpl } = recorder(json({ object: "list", data: [] }, 200, QUOTA));
+  const { calls, fetchImpl } = recorder(json({ object: "list", data: [] }));
   const plugin = await EazyDataPlugin({}, { fetchImpl });
   const out = await plugin.auth.methods[0].authorize({ key: " sk-good " });
   assert.equal(out.type, "success");
@@ -131,7 +127,7 @@ test("the sign-in check keeps the key when the service cannot be reached", async
 });
 
 test("the loader hands out the base URL, the account's key and a guarded fetch", async () => {
-  const { calls, fetchImpl } = recorder(json({ choices: [] }, 200, QUOTA));
+  const { calls, fetchImpl } = recorder(json({ choices: [] }));
   const plugin = await EazyDataPlugin({}, { fetchImpl });
   const loader = await plugin.auth.loader(async () => account);
   assert.equal(loader.baseURL, BASE);
@@ -156,22 +152,21 @@ test("the loader sends nothing when no account is signed in", async () => {
 });
 
 test("a request is rebuilt on the plugin's own origin", async () => {
-  const { calls, fetchImpl } = recorder(json({ ok: true }, 200, QUOTA));
+  const { calls, fetchImpl } = recorder(json({ ok: true }));
   const plugin = await EazyDataPlugin({}, { fetchImpl });
   const loader = await plugin.auth.loader(async () => account);
   await loader.fetch("https://elsewhere.example/v1/chat/completions?trace=1", { method: "POST", body: "{}" });
   assert.equal(calls[0].url, `${BASE}/chat/completions?trace=1`);
 });
 
-test("a spent allowance gets a Retry-After even when the service sent none", async () => {
-  const reset = new Date(Date.now() + 3_600_000).toISOString();
-  const body = { error: { message: "insufficient quota", code: "quota_exceeded", reset_at: reset } };
+test("a spent balance 429 gets a Retry-After when the relay sent none", async () => {
+  const body = { error: { message: "insufficient quota", code: "quota_exceeded" } };
   const plugin = await EazyDataPlugin({}, { fetchImpl: async () => json(body, 429) });
   const loader = await plugin.auth.loader(async () => account);
   const res = await loader.fetch(`${BASE}/chat/completions`, { method: "POST", body: "{}" });
   assert.equal(res.status, 429);
-  const after = Number(res.headers.get("retry-after"));
-  assert.ok(after > 3500 && after <= 3600, `retry-after was ${after}`);
+  // No reset instant for a cumulative balance: a moderate, honest rest.
+  assert.equal(res.headers.get("retry-after"), "3600");
   assert.equal((await res.json()).error.code, "quota_exceeded");
 });
 
@@ -196,18 +191,26 @@ test("other failures pass through untouched", async () => {
   assert.equal(res.headers.get("retry-after"), null);
 });
 
-test("usage reads the allowance from the account's own response headers", async () => {
-  const plugin = await EazyDataPlugin({}, {
-    fetchImpl: async () => json({ object: "list", data: [] }, 200, QUOTA),
+test("usage reads the dollar balance from the relay's billing routes", async () => {
+  const { calls, fetchImpl } = recorder((call) => {
+    if (call.url.endsWith("/dashboard/billing/subscription")) return json(SUBSCRIPTION);
+    if (call.url.endsWith("/dashboard/billing/usage")) return json(USAGE);
+    return json({});
   });
+  const plugin = await EazyDataPlugin({}, { fetchImpl });
   const usage = await plugin.auth.usage(async () => account);
   assert.equal(usage.plan, "eazydata");
   assert.equal(usage.windows.length, 1);
   const [w] = usage.windows;
-  assert.equal(w.limit, 100_000_000);
-  assert.equal(w.amount, 2_500_000);
-  assert.equal(w.used, 2.5);
+  assert.equal(w.unit, "usd");
+  assert.equal(w.limit, 100);
+  assert.equal(w.amount, 0.04);
+  assert.ok(w.used > 0 && w.used < 0.1);
+  assert.match(w.display, /\$99\.96 left of \$100/);
   assert.equal(usage.error, undefined);
+  const urls = calls.map((c) => c.url).sort();
+  assert.ok(urls.some((u) => u.endsWith("/dashboard/billing/subscription")));
+  assert.ok(urls.some((u) => u.endsWith("/dashboard/billing/usage")));
 });
 
 test("usage marks the account when its key stopped working", async () => {
@@ -219,7 +222,7 @@ test("usage marks the account when its key stopped working", async () => {
   assert.ok(usage.error);
 });
 
-test("usage shows an unknown allowance rather than a made-up number", async () => {
+test("usage shows an unknown balance rather than a made-up number", async () => {
   const plugin = await EazyDataPlugin({}, { fetchImpl: async () => json({ object: "list" }) });
   const usage = await plugin.auth.usage(async () => account);
   assert.equal(usage.windows.length, 1);
@@ -228,16 +231,21 @@ test("usage shows an unknown allowance rather than a made-up number", async () =
   assert.ok(usage.windows[0].display);
 });
 
-test("usage falls back to the allowance a request already reported", async () => {
-  let reply = () => json({ choices: [] }, 200, QUOTA);
-  const plugin = await EazyDataPlugin({}, { fetchImpl: async (url, init) => reply(url, init) });
-  const loader = await plugin.auth.loader(async () => account);
-  await loader.fetch(`${BASE}/chat/completions`, { method: "POST", body: "{}" });
-  reply = () => {
-    throw new TypeError("fetch failed");
-  };
+test("usage falls back to a balance an earlier read already saw", async () => {
+  let mode = "ok";
+  const plugin = await EazyDataPlugin({}, {
+    fetchImpl: async (url) => {
+      if (mode === "down") throw new TypeError("fetch failed");
+      if (String(url).endsWith("/dashboard/billing/subscription")) return json(SUBSCRIPTION);
+      if (String(url).endsWith("/dashboard/billing/usage")) return json(USAGE);
+      return json({});
+    },
+  });
+  const first = await plugin.auth.usage(async () => account);
+  assert.equal(first.windows[0].limit, 100);
+  mode = "down";
   const usage = await plugin.auth.usage(async () => account);
-  assert.equal(usage.windows[0].limit, 100_000_000);
+  assert.equal(usage.windows[0].limit, 100);
   assert.ok(usage.error);
 });
 
@@ -248,7 +256,7 @@ test("usage says nothing when no account is signed in", async () => {
 
 test("the models hook offers what the account can actually use", async () => {
   const listing = { object: "list", data: [{ id: "gpt-4o" }, { id: "claude-3.5-sonnet" }] };
-  const plugin = await EazyDataPlugin({}, { fetchImpl: async () => json(listing, 200, QUOTA) });
+  const plugin = await EazyDataPlugin({}, { fetchImpl: async () => json(listing) });
   const before = { [DEFAULT_MODEL]: { name: "already here" } };
   const models = await plugin.provider.models({ models: before }, { auth: account });
   assert.deepEqual(Object.keys(models).sort(), ["claude-3.5-sonnet", "gpt-4o"]);
