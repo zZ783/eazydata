@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# local npm cache used when packing offline
+.npm-cache/
+
+# build output
+*.tgz
+
+# logs
+*.log
+npm-debug.log*
+
+# editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# local env & secrets
+.env
+.env.*
+# npm: local publish settings (registry pin; would carry a token if one is added)
+.npmrc

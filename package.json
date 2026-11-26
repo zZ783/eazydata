@@ -1,0 +1,56 @@
+{
+  "name": "eazydata",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "main": "./opencode.mjs",
+  "exports": {
+    ".": "./opencode2.mjs"
+  },
+  "description": "eazydata provider plugin for Magpie: an OpenAI-compatible relay (eazydata.org) whose model list is read live from /v1/models and whose allowance is read from the x-quota response headers",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "eazydata",
+    "provider",
+    "relay",
+    "openai-compatible"
+  ],
+  "license": "MIT",
+  "author": "zZ783",
+  "homepage": "https://github.com/zZ783/eazydata#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zZ783/eazydata.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zZ783/eazydata/issues"
+  },
+  "files": [
+    "index.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
+    "src/",
+    "test/",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/all.mjs",
+    "check": "node --check index.mjs && node --check src/index.mjs && node test/all.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "magpie": {
+    "name": "eazydata",
+    "summary": {
+      "en": "OpenAI-compatible relay on eazydata.org, with its model list read live from /v1/models and the daily allowance read from the API's own quota headers",
+      "zh": "eazydata.org 上的 OpenAI 兼容中转，模型列表实时读取 /v1/models，每日额度直接读 API 的配额响应头"
+    },
+    "maxConcurrency": 8,
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iOCIgZmlsbD0iIzBkMTYyNCIvPjxwYXRoIGQ9Ik0xMCAyMmwxMi04LTEyLTh6IiBmaWxsPSIjNGRjOWZmIi8+PGNpcmNsZSBjeD0iMjMiIGN5PSIyMiIgcj0iMyIgZmlsbD0iIzM0ZDg5OSIvPjwvc3ZnPg=="
+  }
+}
